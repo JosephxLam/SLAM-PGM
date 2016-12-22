@@ -71,6 +71,55 @@ class BasicMeasurement:
         noise = np.squeeze(np.random.multivariate_normal(np.zeros(self.envFeaturesDim), self.covariance, len(mes)))
         return noise
 
+class EKFModel:
+    def __init__(self, dimension, robotFeaturesDim, envFeaturesDim, motionModel, mesModel, covMes, muInitial):
+        self.robotFeaturesDim = robotFeaturesDim
+        self.envFeaturesDim = envFeaturesDim
+        self.dimension = dimension
+
+        self.Sigma = np.eye(dimension)
+        self.mu = muInitial # np.zeros((1, dimension))
+        self.S = np.zeros(dimension * robotFeaturesDim).reshape((dimension, robotFeaturesDim))
+        self.S[:robotFeaturesDim] = np.eye(robotFeaturesDim)
+        self.Z = covMes
+        self.motionModel = motionModel
+        self.mesModel = mesModel
+
+    def update(self, measures, landmarkIds, command, U):
+        self.__motion_update(command, U)
+        for ldmIndex, ldmMes in zip(landmarkIds, measures):
+            self.__measurement_update(ldmMes, ldmIndex)
+        return self.Sigma, self.mu
+
+    def __motion_update(self, command, U):
+        previousMeanState = self.mu
+        _, meanStateChange = self.motionModel.move(previousMeanState, command=command)
+        self.mu = meanStateChange
+        self.Sigma = self.Sigma + dot(dot(self.S, U), self.S.T)
+
+    def __measurement_update(self, ldmMes, ldmIndex):
+        mu = self.mu
+        Sigma = self.Sigma
+        meanMes, gradMeanMes = self.__get_mean_measurement_params(mu, ldmIndex)
+
+        z = np.atleast_2d(ldmMes)
+        zM = np.atleast_2d(meanMes)
+
+        C = gradMeanMes
+        toInvert = inv(dot(dot(C.T, Sigma), C) + self.Z)
+        K = dot(dot(Sigma,C), toInvert) #-C ?
+
+        self.mu += dot(K,z - zM)
+        self.Sigma = dot(np.eye(self.dimension) - dot(K,C.T), Sigma)
+
+    def __get_mean_measurement_params(self, mu, ldmIndex): #KEPT as is
+        realIndex = self.robotFeaturesDim + ldmIndex * self.envFeaturesDim
+        ldmMeanState = mu[realIndex: realIndex + self.envFeaturesDim]
+        rMeanState = mu[:self.robotFeaturesDim]
+
+        meanMes = self.mesModel.measureFunction(rMeanState, ldmMeanState)
+        gradMeanMes = self.mesModel.gradMeasureFunction(mu, ldmIndex)
+        return meanMes, gradMeanMes
 
 class EIFModel:
     def __init__(self, dimension, robotFeaturesDim, envFeaturesDim, motionModel, mesModel, covMes, muInitial):
@@ -171,7 +220,7 @@ muEIF = np.zeros_like(state)  # Estimated robot state using EIF Algorithm
 muEIF = mu.copy()
 
 
-eif = EIFModel(dimension, robotFeaturesDim, envFeaturesDim, motionModel, measurementModel, covarianceMeasurements, mu)
+eif = EKFModel(dimension, robotFeaturesDim, envFeaturesDim, motionModel, measurementModel, covarianceMeasurements, mu)#EIFModel(dimension, robotFeaturesDim, envFeaturesDim, motionModel, measurementModel, covarianceMeasurements, mu)
 
 mus_simple = np.zeros((T, dimension))
 mus_eif = np.zeros((T, dimension))
@@ -196,7 +245,7 @@ for t in range(1, T):
 
     mu += motionCommand
     # + measurement !
-    muEIF = eif.estimate()
+    #muEIF = eif.estimate()
 
     mus_simple[t] = np.squeeze(mu)
     mus_eif[t] = np.squeeze(muEIF)
