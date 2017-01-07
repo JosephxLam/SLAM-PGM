@@ -166,6 +166,69 @@ class EIFModel:
         b = self.b if b is None else b
         return clipState(dot(b, inv(H)).T)
 
+class EKFModel:
+    def __init__(self, dimension, robotFeaturesDim, envFeaturesDim, motionModel, mesModel, covMes, muInitial):
+        self.robotFeaturesDim = robotFeaturesDim
+        self.envFeaturesDim = envFeaturesDim
+        self.dimension = dimension
+
+        self.Sigma = np.eye(dimension)
+        self.mu = muInitial.copy() # np.zeros((1, dimension))
+        self.S = np.zeros(dimension * robotFeaturesDim).reshape((dimension, robotFeaturesDim))
+        self.S[:robotFeaturesDim] = np.eye(robotFeaturesDim)
+        self.Z = covMes
+        self.motionModel = motionModel
+        self.mesModel = mesModel
+
+    def update(self, measures, landmarkIds, command, U):
+        self.__motion_update(command, U)
+        for ldmIndex, ldmMes in zip(landmarkIds, measures):
+            self.__measurement_update(ldmMes, int(ldmIndex))
+        return self.Sigma, self.mu
+
+    def __motion_update(self, command, U):
+        previousMeanState = self.mu
+        meanStateChange = self.motionModel.exact_move(previousMeanState, command)
+        newMeanState = clipState(previousMeanState + meanStateChange)
+
+        # TO IMPROVE
+        angle = previousMeanState[2, 0]  # TO IMPROVE
+        gradMeanMotion = np.zeros_like(self.Sigma)  # TO IMPROVE
+        gradMeanMotion[2, 0:2] = command[0] * np.array([-math.sin(angle), math.cos(angle)])  # TO IMPROVE
+
+        IA = np.eye(self.Sigma.shape[0]) + gradMeanMotion  # TO IMPROVE
+        self.mu = newMeanState
+        self.Sigma = dot(dot(IA, self.Sigma), IA.T) + dot(dot(self.S, U), self.S.T)
+
+    def __measurement_update(self, ldmMes, ldmIndex):
+        mu = self.mu
+        Sigma = self.Sigma
+        meanMes, gradMeanMes = self.__get_mean_measurement_params(mu, ldmIndex)
+
+        z = np.array(ldmMes).reshape(len(ldmMes), 1)
+        zM = np.array(meanMes).reshape(len(ldmMes), 1)
+        C = gradMeanMes
+
+        toInvert = inv(dot(dot(C.T, Sigma), C) + self.Z)
+        K = dot(dot(Sigma,C), toInvert)
+
+        mesError = (z - zM)
+        mesError[1, 0] = clipAngle(mesError[1, 0], force=True)
+        mesError = dot(K,mesError)
+        mesError[1, 0] = clipAngle(mesError[1, 0])
+
+        self.mu += mesError
+        self.Sigma = dot(np.eye(self.dimension) - dot(K, C.T), Sigma)
+
+    def __get_mean_measurement_params(self, mu, ldmIndex):
+        realIndex = self.robotFeaturesDim + ldmIndex * self.envFeaturesDim
+        ldmMeanState = mu[realIndex: realIndex + self.envFeaturesDim]
+        rMeanState = mu[:self.robotFeaturesDim]
+
+        meanMes = self.mesModel.measureFunction(rMeanState, ldmMeanState)
+        gradMeanMes = self.mesModel.gradMeasureFunction(rMeanState, ldmMeanState, realIndex)
+        return meanMes, gradMeanMes
+
 
 # class Robot:
 #     def __init__(self, maxSpeed, maxRotation, detectionSize, detectionCone, featuresDim, covarianceMotion, covarianceMeasurements):
@@ -262,6 +325,7 @@ if __name__ == '__main__':
     # Basic and EIF estimator for robot state
     mu = state.copy()
     mu[robotFeaturesDim:] += np.random.normal(0, covarianceMeasurements[0, 0], nbLandmark * envFeaturesDim).reshape(nbLandmark * envFeaturesDim, 1)
+    muEKF = mu.copy()
     muEIF = mu.copy()
 
     ## --------------------
@@ -269,14 +333,17 @@ if __name__ == '__main__':
 
     motionModel = BasicMovement(maxSpeed, maxRotation, covarianceMotion, measureFunction)
     measurementModel = BasicMeasurement(covarianceMeasurements, robotFeaturesDim, envFeaturesDim, measureFunction, gradMeasureFunction, detectionSize, detectionCone)
-    eif = EIFModel(dimension, robotFeaturesDim, envFeaturesDim, motionModel, measurementModel, covarianceMeasurements, mu)
-
+    ekf = EKFModel(dimension, robotFeaturesDim, envFeaturesDim, motionModel, measurementModel, covarianceMeasurements, mu)
+    eif = EIFModel(dimension, robotFeaturesDim, envFeaturesDim, motionModel, measurementModel, covarianceMeasurements,
+                   mu)
 
     mus_simple = np.zeros((T, dimension))
+    mus_ekf = np.zeros((T, dimension))
     mus_eif = np.zeros((T, dimension))
     states = np.zeros((T, dimension))
 
     mus_simple[0] = np.squeeze(mu)
+    mus_ekf[0] = np.squeeze(muEKF)
     mus_eif[0] = np.squeeze(muEIF)
     states[0] = np.squeeze(state)
 
@@ -285,6 +352,8 @@ if __name__ == '__main__':
     print("BEFORE")
     print("EIF estimate :")
     print(muEIF)
+    print("EKF estimate :")
+    print(muEKF)
     print("Real state :")
     print(state)
     print('\n')
@@ -296,10 +365,13 @@ if __name__ == '__main__':
 
         mu += motionModel.exact_move(mu, motionCommand)
 
+        ekf.update(measures, landmarkIds, motionCommand, covarianceMotion)
         eif.update(measures, landmarkIds, motionCommand, covarianceMotion)
         muEIF = eif.estimate()
+        muEKF = ekf.mu
 
         mus_simple[t] = np.squeeze(mu)
+        mus_ekf[t] = np.squeeze(muEKF)
         mus_eif[t] = np.squeeze(muEIF)
         states[t] = np.squeeze(state)
 
@@ -309,12 +381,18 @@ if __name__ == '__main__':
     print('AFTER')
     print("EIF estimate :")
     print(muEIF)
+    print("EKF estimate :")
+    print(muEKF)
     print("Real state :")
     print(state)
-    print("Final Error :")
+    print("Final Error EIF:")
     print(state - muEIF)
-    print("Final Max Error : %f" % max(state-muEIF))
-    print("Final Norm Error : %f" % np.linalg.norm(state-muEIF))
+    print("Final Error EKF:")
+    print(state - muEKF)
+    print("Final Max Error EIF: %f" % max(state-muEIF))
+    print("Final Norm Error EIF: %f" % np.linalg.norm(state-muEIF))
+    print("Final Max Error EKF: %f" % max(state-muEKF))
+    print("Final Norm Error EIF: %f" % np.linalg.norm(state-muEKF))
 
     landmarks = state[robotFeaturesDim:].reshape(nbLandmark, 2)
     plt.figure()
@@ -327,8 +405,10 @@ if __name__ == '__main__':
 
     plt.plot(states[:, 0], states[:, 1])
     plt.plot(mus_simple[:, 0], mus_simple[:, 1])
+    plt.plot(mus_ekf[:, 0], mus_ekf[:, 1])
     plt.plot(mus_eif[:, 0], mus_eif[:, 1])
 
-    plt.legend(['Real position', 'Simple estimate', 'EIF estimate'])
+    plt.legend(['Real position', 'Simple estimate', 'EKF estimate', 'EIF estimate'])
     plt.title("{0} landmarks".format(nbLandmark))
     plt.show()
+
