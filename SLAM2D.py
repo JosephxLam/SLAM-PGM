@@ -5,7 +5,8 @@ from matplotlib import pyplot as plt
 from matplotlib.patches import Circle
 import math
 import seaborn
-
+from scipy import sparse
+from scipy.sparse import linalg
 
 def dots(*arg):
     return multi_dot(arg)
@@ -342,7 +343,7 @@ class SEIFModel:
         self.maxLinks = maxLinks
 
     def update(self, measures, landmarkIds, command, U):
-        self.__motion_update(command, U)
+        self.__motion_update_sparse(command, U)
         self.__mean_update()
         for ldmIndex, ldmMes in zip(landmarkIds, measures):
             self.__measurement_update(ldmMes, int(ldmIndex))
@@ -371,6 +372,35 @@ class SEIFModel:
         # self.b = self.b - dot(previousMeanState.T, self.H - H) + dot(meanStateChange.T, H)
         self.H = H
         self.b = dot(newMeanState.T,  self.H)
+        self.mu = newMeanState
+
+
+    def __motion_update_sparse(self, command, U):
+        r = self.robotFeaturesDim
+        previousMeanState = self.estimate()
+        meanStateChange = self.motionModel.exact_move(previousMeanState, command)
+        newMeanState = clipState(previousMeanState + meanStateChange)
+
+        # TO IMPROVE
+        angle = previousMeanState[2, 0]  # TO IMPROVE
+        gradMeanMotion = np.zeros_like(self.H)  # TO IMPROVE
+        gradMeanMotion[2, 0:2] = command[0] * np.array([-math.sin(angle), math.cos(angle)])  # TO IMPROVE
+
+        Sx = sparse.bsr_matrix(self.Sx)
+        sH = sparse.bsr_matrix(self.H)
+        invU = sparse.coo_matrix(inv(U))
+        sparseGradMeanMotion = sparse.bsr_matrix(gradMeanMotion)
+
+        delta = Sx.T.dot(sparseGradMeanMotion).dot(Sx)
+        G = Sx.dot(linalg.inv(sparse.eye(r) + delta) - sparse.eye(r)).dot(Sx.T)
+        phi = sparse.eye(self.dimension) + G
+        Hp = phi.T.dot(sH).dot(phi)
+        deltaH = Hp.dot(Sx).dot(linalg.inv(invU + Sx.T.dot(Hp).dot(Sx))).dot(Sx.T).dot(Hp)
+        # H = inv(Hp + dots(self.Sx, U, self.Sx.T))
+        H = Hp - deltaH
+        # self.b = self.b - dot(previousMeanState.T, self.H - H) + dot(meanStateChange.T, H)
+        self.H = H.todense()
+        self.b = H.dot(newMeanState).T
         self.mu = newMeanState
 
     def __mean_update(self):
@@ -436,38 +466,25 @@ class SEIFModel:
     def __sparsification(self):
         x = np.arange(self.robotFeaturesDim)
         y0, yp = self.__partition_links()
-        Sx = self.__build_projection_matrix(x)
-        Sy0 = self.__build_projection_matrix(y0)
-        Sxy0 = self.__build_projection_matrix(np.concatenate((x, y0)))
-        Sxyp = self.__build_projection_matrix(np.concatenate((x, yp)))
-        Sxy0yp = self.__build_projection_matrix(np.concatenate((x, y0, yp)))
+        Sx = sparse.coo_matrix(self.__build_projection_matrix(x))
+        Sy0 = sparse.coo_matrix(self.__build_projection_matrix(y0))
+        Sxy0 = sparse.coo_matrix(self.__build_projection_matrix(np.concatenate((x, y0))))
+        Sxyp = sparse.coo_matrix(self.__build_projection_matrix(np.concatenate((x, yp))))
+        Sxy0yp = sparse.coo_matrix(self.__build_projection_matrix(np.concatenate((x, y0, yp))))
+        H = sparse.bsr_matrix(self.H)
 
-        # print("yp")
-        # print(yp)
-        # print("y0")
-        # print(y0)
-        # print(Sxy0yp)
-        # print("self.H")
-        # print(self.H)
+        Hp = Sxy0yp.dot(Sxy0yp.T).dot(H).dot(Sxy0yp).dot(Sxy0yp.T)
 
-        Hp = dots(Sxy0yp, Sxy0yp.T, self.H, Sxy0yp, Sxy0yp.T)
-        # print("Hp")
-        # print(Hp)
-        # print(self.H - Hp)
-
-        Ht = self.H - dots(Hp, Sy0, inv(dots(Sy0.T, Hp, Sy0)), Sy0.T, Hp) \
-                    + dots(Hp, Sxy0, inv(dots(Sxy0.T, Hp, Sxy0)), Sxy0.T, Hp) \
-                    - dots(self.H, Sx, inv(dots(Sx.T, self.H, Sx)), Sx.T, self.H)
+        Ht = H - (0 if not y0.size else Hp.dot(Sy0).dot(linalg.inv(Sy0.T.dot(Hp).dot(Sy0))).dot(Sy0.T).dot(Hp)) \
+                + Hp.dot(Sxy0).dot(linalg.inv(Sxy0.T.dot(Hp).dot(Sxy0))).dot(Sxy0.T).dot(Hp) \
+                - H.dot(Sx).dot(linalg.inv(Sx.T.dot(H).dot(Sx))).dot(Sx.T).dot(H)
         eps = 1e-5
-        Ht[np.abs(Ht) < eps] = 0
-        bt = self.b + dot(self.mu.T, Ht - self.H)
+        Htt = Ht.todense()
+        Htt[np.abs(Htt) < eps] = 0
+        bt = self.b + (Ht - H).dot(self.mu)
 
-        self.H = Ht
+        self.H = Htt
         self.b = bt
-        # print("bt")
-        # print(bt)
-        # print("Ht")
-        # print(Ht)
 
     def __get_mean_measurement_params(self, mu, ldmIndex):
         realIndex = self.robotFeaturesDim + ldmIndex * self.envFeaturesDim
@@ -666,14 +683,14 @@ if __name__ == '__main__':
 
     def simu():
         global dimension
-        T = 10  # Number of timesteps
+        T = 15  # Number of timesteps
         nbLandmark = 900
         maxSpeed = 5
         maxRotation = 45 * math.pi / 180  # 45  # en radians
         sizeMap = 100
 
         # Robot Detection Parameters
-        detectionSize = 3  # 40
+        detectionSize = 4  # 40
         detectionCone = 180 * math.pi / 180  # en radians
 
         # Dimension Constants
@@ -724,7 +741,7 @@ if __name__ == '__main__':
         measurementModel = BasicMeasurement(covarianceMeasurements, robotFeaturesDim, envFeaturesDim, measureFunction, gradMeasureFunction, detectionSize, detectionCone)
         ekf = EKFModel(dimension, robotFeaturesDim, envFeaturesDim, motionModel, measurementModel, covarianceMeasurements, mu)
         eif = EIFModel(dimension, robotFeaturesDim, envFeaturesDim, motionModel, measurementModel, covarianceMeasurements, mu)
-        seif = SEIFModel(dimension, robotFeaturesDim, envFeaturesDim, motionModel, measurementModel, covarianceMeasurements, mu, 2)
+        seif = SEIFModel(dimension, robotFeaturesDim, envFeaturesDim, motionModel, measurementModel, covarianceMeasurements, mu, 4)
         # seif2 = SEIFModel2(dimension, robotFeaturesDim, envFeaturesDim, motionModel, measurementModel, covarianceMeasurements, mu, 2)
 
         mus_simple = np.zeros((T, dimension))
@@ -759,16 +776,20 @@ if __name__ == '__main__':
 
             mu += motionModel.exact_move(mu, motionCommand)
 
-            ekf.update(measures, landmarkIds, motionCommand, covarianceMotion)
-            # eif.update(measures, landmarkIds, motionCommand, covarianceMotion)
-            seif.update(measures, landmarkIds, motionCommand, covarianceMotion)
-            # seif2.update(measures, landmarkIds, motionCommand, covarianceMotion)
-            # print "eif.H"
-            # print eif.H
-            muEKF = ekf.estimate()
+            # H, _ = ekf.update(measures, landmarkIds, motionCommand, covarianceMotion)
+            # print (H != 0).sum(), ' / ', H.size
+            # H, _, _ = eif.update(measures, landmarkIds, motionCommand, covarianceMotion)
+            # print (H != 0).sum(), ' / ', H.size
+            H, _, _ = seif.update(measures, landmarkIds, motionCommand, covarianceMotion)
+            print (H != 0).sum(), ' / ', H.size
+            # H, _, _ = seif2.update(measures, landmarkIds, motionCommand, covarianceMotion)
+            # print (H != 0).sum(), ' / ', H.size
+
+            # muEKF = ekf.estimate()
             # muEIF = eif.estimate()
             muSEIF = seif.estimate()
             # muSEIF2 = seif2.estimate()
+
             # print "np.linalg.norm(muEIF-muSEIF)"
             # print np.linalg.norm(muEIF-muSEIF)
             # print np.linalg.norm(eif.b - seif.b)
@@ -778,7 +799,7 @@ if __name__ == '__main__':
 
 
             mus_simple[t] = np.squeeze(mu)
-            mus_ekf[t] = np.squeeze(muEKF)
+            # mus_ekf[t] = np.squeeze(muEKF)
             # mus_eif[t] = np.squeeze(muEIF)
             mus_seif[t] = np.squeeze(muSEIF)
             # mus_seif2[t] = np.squeeze(muSEIF2)
@@ -816,7 +837,7 @@ if __name__ == '__main__':
 
         plt.plot(states[:, 0], states[:, 1])
         plt.plot(mus_simple[:, 0], mus_simple[:, 1])
-        plt.plot(mus_ekf[:, 0], mus_ekf[:, 1])
+        # plt.plot(mus_ekf[:, 0], mus_ekf[:, 1])
         # plt.plot(mus_eif[:, 0], mus_eif[:, 1])
         plt.plot(mus_seif[:, 0], mus_seif[:, 1])
         # plt.plot(mus_seif2[:, 0], mus_seif2[:, 1])
